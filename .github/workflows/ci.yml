@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install frontend deps
+        run: npm ci --prefix frontend/shell
+
+      - name: Build frontend
+        run: npm run build --prefix frontend/shell
+
+      - name: Install service deps (best-effort)
+        run: |
+          npm ci --prefix services/user-service || true
+          npm ci --prefix services/device-service || true
+          npm ci --prefix services/automation-service || true
+          npm ci --prefix services/notification-service || true
+
+      - name: Lint / Tests placeholder
+        run: echo "Add lint/test steps as needed"
