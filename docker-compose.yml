@@ -185,6 +185,18 @@ services:
     networks:
       - smarthome-net
 
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: kafka:29092
+      JVM_OPTS: -Xms64M -Xmx128M
+    depends_on:
+      - kafka
+    networks:
+      - smarthome-net
+
 networks:
   smarthome-net:
     driver: bridge

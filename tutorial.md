@@ -1,135 +1,138 @@
-# 🛡️ Securing Microservices with JSON Web Tokens (JWT)
+# � Kafka — Event Streaming in this Repo
 
-> **A comprehensive guide to implementing stateless authentication and authorization in distributed systems.**
-
----
-
-## 📖 1. Introduction
-In a microservice architecture, protecting REST APIs is a challenge. Traditional session-based security creates bottlenecks because it requires shared state. **JSON Web Tokens (JWT)** provide a modern solution by allowing services to verify user identity independently and securely.
-
-## 🔄 2. The Shift: Sessions vs. Tokens
-In a monolith, the server "remembers" you via a session ID stored in memory. In microservices, this fails because services are distributed and need to scale horizontally.
-
-| Feature | Server-Side Sessions | JWT (Stateless) |
-| :--- | :--- | :--- |
-| **Storage** | Server Memory or Redis | Client-side (Encoded String) |
-| **Scalability** | Requires session replication | Naturally scalable |
-| **Verification** | Must check a database/cache | Validated locally via math (keys) |
-| **Independence** | Services are coupled to the Session DB | Services are decoupled |
-
-
+> **A concise, repo-focused guide to Kafka, how it's used here, and practical tests you can run locally.**
 
 ---
 
-## 🧩 3. Anatomy of a JWT: Deep Dive
-A JWT is a string separated by two dots (`.`). It consists of three parts:
+## 📖 1. Why Kafka in this project
+This repo uses **Kafka** for durable event streaming and asynchronous domain events (e.g., `device-events`, `automation-events`). Kafka provides **retention**, **replay**, **scalability**, and **multiple independent consumers** — ideal for audit logs, automations, and event-driven integrations.
 
-### 3.1 The Header
-Specifies the metadata, mainly the algorithm used for the signature.
-```json
-{
-  "alg": "RS256",
-  "typ": "JWT"
-}
+**Key topics in this repo:**
+- `device-events` — produced by the Device Service when devices are added or their state changes.
+- `automation-events` — produced/consumed by automation logic; `device-service` subscribes to it to apply automation results.
 
+---
+
+## ⚙️ 2. Quickstart — bring Kafka & the stack up
+From the repo root:
+
+```bash
+# Build and start required services (Kafka, Zookeeper, services, Kafdrop UI)
+docker compose up -d --build
+
+# Check containers
+docker compose ps
 ```
 
-### 3.2 The Payload (The Claims)
-
-This contains the data you want to share. Standard claims include:
-
-* `sub` (Subject): The User ID.
-* `iat` (Issued At): When the token was created.
-* `exp` (Expiration): When the token becomes invalid.
-* `roles`: Custom claim for authorization.
-
-### 3.3 The Signature
-
-The signature is created by taking the encoded header, the encoded payload, a secret (or private key), and the algorithm specified in the header.
-
-> **Formula:** `RSASHA256(base64UrlEncode(header) + "." + base64UrlEncode(payload), privateKey)`
+Open Kafdrop (web UI) at **http://localhost:9000** to browse topics and messages. If you prefer the Kafka CLI, use `docker compose exec kafka` for `kafka-topics`, `kafka-console-producer` and `kafka-console-consumer`.
 
 ---
 
-## 🏗️ 4. The Microservices Architecture Flow
+## 🧪 3. Test producing & consuming messages
+### Option A — Use kcat (fast from host)
 
-In a real-world scenario, you often have an **API Gateway** acting as the entry point.
+Produce a test automation event:
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant Gateway as API Gateway
-    participant Auth as Auth Service
-    participant Orders as Order Service
-
-    User->>Auth: 1. Login(credentials)
-    Auth-->>User: 2. Return JWT & Refresh Token
-    
-    User->>Gateway: 3. Request /orders (Bearer <JWT>)
-    Note over Gateway: Optional: Global JWT Validation
-    
-    Gateway->>Orders: 4. Forward Request + JWT
-    Note over Orders: 5. Verify Signature & Role Locally
-    
-    Orders-->>User: 6. 200 OK (Data)
-
+```bash
+# On Windows use host.docker.internal:9092 if localhost fails
+echo '{"type":"automation.executed","actions":[{"deviceId":1,"state":{"on":true}}]}' \
+  | docker run --rm -i edenhill/kcat:1.7.0 -b host.docker.internal:9092 -t automation-events -P
 ```
 
-### 4.1 Authorization vs. Authentication
+Consume recent messages:
 
-* **Authentication:** "Who are you?" (Handled by the Auth Service).
-* **Authorization:** "What are you allowed to do?" (Handled by individual microservices using the `roles` claim).
+```bash
+docker run --rm edenhill/kcat:1.7.0 -b host.docker.internal:9092 -t automation-events -C -o beginning
+```
 
----
+### Option B — Use Kafka tools inside the container
 
-## 🔐 5. Advanced Security: RS256 & JWKS
+List topics:
 
-Using a single "Secret Password" (HS256) across all services is risky. If one service is hacked, the whole system is compromised. Instead, use **Asymmetric Encryption (RS256)**.
+```bash
+docker compose exec kafka kafka-topics --bootstrap-server localhost:9092 --list
+```
 
-### 5.1 The Private/Public Key Split
+Produce with console-producer:
 
-* **Auth Service:** Holds the **Private Key**. It is the only service that can *issue* tokens.
-* **Microservices:** Hold the **Public Key**. They can only *read* and *verify* tokens.
+```bash
+docker compose exec kafka bash -c "echo '{\"type\":\"automation.executed\",\"actions\":[{\"deviceId\":1,\"state\":{\"on\":true}}]}' | kafka-console-producer --broker-list localhost:9092 --topic automation-events"
+```
 
-### 5.2 Automated Key Management (JWKS)
+Consume from beginning:
 
-A **JSON Web Key Set (JWKS)** is an endpoint (e.g., `/.well-known/jwks.json`) where the Auth Service publishes its public keys.
-
-* **Benefit:** When you want to rotate keys (change them for security), you don't have to restart your 50 microservices. They simply fetch the new public key from the JWKS endpoint automatically.
-
----
-
-## ⚠️ 6. Solving the "Stateless" Problem: Revocation
-
-Because JWTs live on the client, you cannot "log a user out" instantly by deleting a session.
-
-### 6.1 The Refresh Token Pattern
-
-Since Access Tokens (JWTs) should be short-lived (e.g., 15 mins), we use a **Refresh Token** (stored in a database) to get new ones.
-
-* **Logout:** Delete the Refresh Token from the DB. The user stays logged in for a maximum of 15 minutes until their current JWT expires.
-* **Token Rotation:** Every time a Refresh Token is used, issue a *new* Refresh Token and invalidate the old one. This detects if a token has been stolen.
+```bash
+docker compose exec kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic automation-events --from-beginning --max-messages 10
+```
 
 ---
 
-## 🛠️ 7. Implementation Best Practices
+## 🔍 4. Verify service behavior (repo-specific)
+- Watch the **Device Service** logs — it subscribes to `automation-events` and logs when events are handled:
 
-To ensure a production-grade system, follow these rules:
+```bash
+docker compose logs -f device-service
+# Look for: "Received automation event: {...}"
+```
 
-### 7.1 Security Checklist
+- Creating or updating a device via the API publishes to `device-events` (see `services/device-service/index.js` lines that call `kafkaProducer.send` when devices are added or state changes).
 
-* [ ] **HTTPS Only:** Never transmit tokens over HTTP.
-* [ ] **Cookie Security:** If storing in a browser, use `HttpOnly` and `SameSite=Strict` flags to prevent XSS and CSRF attacks.
-* [ ] **Validate Audience (`aud`):** Ensure the token was intended for the specific service receiving it.
-* [ ] **Check Expiration:** Always reject tokens where `currentTime > exp`.
+Example: create a device (this will also publish a `device.added` event):
 
-### 7.2 Common Pitfalls
+```bash
+curl -X POST http://localhost/api/devices \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Test Light","type":"light"}'
+```
 
-* **Payload Bloat:** Don't put too much data in the JWT. It is sent with *every* request, so a huge JWT will slow down your network.
-* **Trusting the Header:** Never trust the `alg: none` exploit. Always hardcode your expected algorithm (like RS256) in your verification logic.
+Then inspect Kafdrop or the `device-events` topic to see the message.
 
 ---
 
-## 🏁 8. Conclusion
+## 🧩 5. Quick reference — where Kafka is used in the code
+- **Producer usage:** in `services/device-service/index.js` (look for `kafkaProducer.send({ topic: 'device-events', ... })`).
+- **Consumer usage:** same file subscribes to `automation-events` via `kafka.consumer()` and handles `automation.executed` events.
 
-JWTs are the backbone of modern distributed security. They allow microservices to remain **fast, stateless, and decoupled**. While they introduce challenges regarding revocation, the combination of **Short-lived Access Tokens**, **Refresh Tokens**, and **JWKS** provides a robust, enterprise-grade security posture.
+These examples use the `kafkajs` client (`const { Kafka } = require('kafkajs')`) for both producing and consuming.
+
+---
+
+## 🛠️ 6. Troubleshooting & common pitfalls
+- Windows host access: if host tools can't reach Kafka, use `host.docker.internal:9092` or update `KAFKA_ADVERTISED_LISTENERS` to include an address reachable from the host. 
+- If messages don't appear in Kafdrop but do in logs, check listener configuration and advertised listeners. 
+- Topics may be auto-created; if not, create them explicitly with `kafka-topics`.
+
+**Useful debug commands:**
+
+```bash
+# Describe topic
+docker compose exec kafka kafka-topics --bootstrap-server localhost:9092 --topic automation-events --describe
+
+# List consumer groups
+docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --list
+
+# Describe a consumer group
+docker compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group device-service-group
+```
+
+---
+
+## 📈 7. Best practices (brief)
+- Use **keys** for ordered processing per entity (e.g., deviceId as message key). 
+- Keep messages **idempotent** or include unique ids to avoid duplicate processing. 
+- Set **retention** and partition count according to expected throughput & retention requirements. 
+- Monitor consumer lags (consumer groups) and set appropriate **alerts**.
+
+---
+
+## ✅ 8. Quick playbook (one-minute test)
+1. Start the stack: `docker compose up -d --build` ✅
+2. Open Kafdrop: http://localhost:9000 ✅
+3. Produce a test event using kcat or `kafka-console-producer` ✅
+4. Check `device-service` logs: `docker compose logs -f device-service` — look for consumption logs ✅
+
+---
+
+## Wrap-up
+This guide gives you practical steps to explore Kafka in this repository, run quick tests, and locate where events are produced and consumed in the codebase. If you want, I can add an automated test script under `scripts/` (e.g., `scripts/test-kafka.js`) to produce and verify messages end-to-end — shall I add it? 🚀

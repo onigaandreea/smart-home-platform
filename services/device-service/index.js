@@ -36,8 +36,8 @@ async function initDB() {
       )
     `);
 
-        // Insert sample devices
-        const count = await client.query('SELECT COUNT(*) FROM devices WHERE user_id = 1');
+        // Insert sample devices only if none exist
+        const count = await client.query('SELECT COUNT(*) FROM devices');
         if (count.rows[0].count === '0') {
             await client.query(`
         INSERT INTO devices (user_id, home_id, name, type, room, status, state) VALUES
@@ -77,22 +77,26 @@ async function connectRabbitMQ() {
                 const command = JSON.parse(msg.content.toString());
                 console.log('Received device command:', command);
 
-                // Update device state
-                await pool.query(
-                    'UPDATE devices SET state = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2',
-                    [JSON.stringify(command.state), command.deviceId]
-                );
+                try {
+                    // Update device state
+                    await pool.query(
+                        'UPDATE devices SET state = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2',
+                        [JSON.stringify(command.state), command.deviceId]
+                    );
 
-                // Acknowledge command processed
-                rabbitChannel.sendToQueue(
-                    'device.status',
-                    Buffer.from(JSON.stringify({
-                        deviceId: command.deviceId,
-                        status: 'success',
-                        state: command.state
-                    })),
-                    { persistent: true }
-                );
+                    // Acknowledge command processed
+                    rabbitChannel.sendToQueue(
+                        'device.status',
+                        Buffer.from(JSON.stringify({
+                            deviceId: command.deviceId,
+                            status: 'success',
+                            state: command.state
+                        })),
+                        { persistent: true }
+                    );
+                } catch (error) {
+                    console.error('Error processing device command:', error);
+                }
 
                 rabbitChannel.ack(msg);
             }
@@ -108,7 +112,7 @@ connectRabbitMQ();
 // Kafka connection
 const kafka = new Kafka({
     clientId: 'device-service',
-    brokers: process.env.KAFKA_BROKERS.split(',')
+    brokers: process.env.KAFKA_BROKERS ? process.env.KAFKA_BROKERS.split(',') : ['kafka:29092']
 });
 
 const kafkaProducer = kafka.producer();
@@ -132,10 +136,14 @@ async function connectKafka() {
                     // Update affected devices
                     for (const action of event.actions || []) {
                         if (action.deviceId) {
-                            await pool.query(
-                                'UPDATE devices SET state = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2',
-                                [JSON.stringify(action.state), action.deviceId]
-                            );
+                            try {
+                                await pool.query(
+                                    'UPDATE devices SET state = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2',
+                                    [JSON.stringify(action.state), action.deviceId]
+                                );
+                            } catch (error) {
+                                console.error('Error updating device from automation:', error);
+                            }
                         }
                     }
                 }
@@ -170,10 +178,34 @@ function authenticateToken(req, res, next) {
 // GET /api/devices - Get all user's devices
 app.get('/api/devices', authenticateToken, async (req, res) => {
     try {
-        const result = await pool.query(
-            'SELECT * FROM devices WHERE user_id = $1 ORDER BY room, name',
-            [req.user.id]
-        );
+        const { room, type, status } = req.query;
+
+        let query = 'SELECT * FROM devices WHERE user_id = $1';
+        const params = [req.user.id];
+        let paramCount = 1;
+
+        // Add filters if provided
+        if (room) {
+            paramCount++;
+            query += ` AND room = $${paramCount}`;
+            params.push(room);
+        }
+
+        if (type) {
+            paramCount++;
+            query += ` AND type = $${paramCount}`;
+            params.push(type);
+        }
+
+        if (status) {
+            paramCount++;
+            query += ` AND status = $${paramCount}`;
+            params.push(status);
+        }
+
+        query += ' ORDER BY room, name';
+
+        const result = await pool.query(query, params);
 
         res.json({ devices: result.rows });
     } catch (error) {
@@ -206,26 +238,61 @@ app.post('/api/devices', authenticateToken, async (req, res) => {
     try {
         const { name, type, room, home_id } = req.body;
 
+        // Validation
+        if (!name || !type) {
+            return res.status(400).json({ error: 'Name and type are required' });
+        }
+
+        const validTypes = ['light', 'thermostat', 'lock', 'camera', 'sprinkler'];
+        if (!validTypes.includes(type)) {
+            return res.status(400).json({ error: 'Invalid device type' });
+        }
+
+        // Set default state based on device type
+        let defaultState = {};
+        switch (type) {
+            case 'light':
+                defaultState = { on: false, brightness: 100 };
+                break;
+            case 'thermostat':
+                defaultState = { temperature: 22, mode: 'auto' };
+                break;
+            case 'lock':
+                defaultState = { locked: true };
+                break;
+            case 'camera':
+                defaultState = { recording: false };
+                break;
+            case 'sprinkler':
+                defaultState = { active: false };
+                break;
+        }
+
         const result = await pool.query(
             'INSERT INTO devices (user_id, home_id, name, type, room, status, state) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
-            [req.user.id, home_id || 1, name, type, room, 'offline', JSON.stringify({})]
+            [req.user.id, home_id || 1, name, type, room || 'Unassigned', 'offline', JSON.stringify(defaultState)]
         );
 
         const device = result.rows[0];
 
         // Publish device added event to Kafka
-        await kafkaProducer.send({
-            topic: 'device-events',
-            messages: [{
-                key: device.id.toString(),
-                value: JSON.stringify({
-                    type: 'device.added',
-                    device,
-                    userId: req.user.id,
-                    timestamp: new Date().toISOString()
-                })
-            }]
-        });
+        try {
+            await kafkaProducer.send({
+                topic: 'device-events',
+                messages: [{
+                    key: device.id.toString(),
+                    value: JSON.stringify({
+                        type: 'device.added',
+                        device,
+                        userId: req.user.id,
+                        timestamp: new Date().toISOString()
+                    })
+                }]
+            });
+        } catch (kafkaError) {
+            console.error('Failed to publish to Kafka:', kafkaError);
+            // Don't fail the request if Kafka publish fails
+        }
 
         res.status(201).json({
             message: 'Device added successfully',
@@ -237,30 +304,66 @@ app.post('/api/devices', authenticateToken, async (req, res) => {
     }
 });
 
+// PUT /api/devices/:id - Update device info
+app.put('/api/devices/:id', authenticateToken, async (req, res) => {
+    try {
+        const { name, room, type } = req.body;
+
+        if (!name) {
+            return res.status(400).json({ error: 'Device name is required' });
+        }
+
+        const result = await pool.query(
+            'UPDATE devices SET name = $1, room = $2, type = COALESCE($3, type) WHERE id = $4 AND user_id = $5 RETURNING *',
+            [name, room || 'Unassigned', type, req.params.id, req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Device not found' });
+        }
+
+        res.json({
+            message: 'Device updated successfully',
+            device: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Update device error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // PUT /api/devices/:id/state - Update device state
 app.put('/api/devices/:id/state', authenticateToken, async (req, res) => {
     try {
         const { state } = req.body;
         const deviceId = req.params.id;
 
+        if (!state || typeof state !== 'object') {
+            return res.status(400).json({ error: 'Valid state object is required' });
+        }
+
         // Send command to device via RabbitMQ
         if (rabbitChannel) {
-            rabbitChannel.sendToQueue(
-                'device.command',
-                Buffer.from(JSON.stringify({
-                    deviceId,
-                    state,
-                    userId: req.user.id,
-                    timestamp: new Date().toISOString()
-                })),
-                { persistent: true }
-            );
+            try {
+                rabbitChannel.sendToQueue(
+                    'device.command',
+                    Buffer.from(JSON.stringify({
+                        deviceId,
+                        state,
+                        userId: req.user.id,
+                        timestamp: new Date().toISOString()
+                    })),
+                    { persistent: true }
+                );
+            } catch (rabbitError) {
+                console.error('Failed to send to RabbitMQ:', rabbitError);
+            }
         }
 
         // Update in database
         const result = await pool.query(
-            'UPDATE devices SET state = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2 AND user_id = $3 RETURNING *',
-            [JSON.stringify(state), deviceId, req.user.id]
+            'UPDATE devices SET state = $1, last_seen = CURRENT_TIMESTAMP, status = $2 WHERE id = $3 AND user_id = $4 RETURNING *',
+            [JSON.stringify(state), 'online', deviceId, req.user.id]
         );
 
         if (result.rows.length === 0) {
@@ -270,19 +373,23 @@ app.put('/api/devices/:id/state', authenticateToken, async (req, res) => {
         const device = result.rows[0];
 
         // Publish state change event to Kafka
-        await kafkaProducer.send({
-            topic: 'device-events',
-            messages: [{
-                key: deviceId.toString(),
-                value: JSON.stringify({
-                    type: 'device.state_changed',
-                    deviceId,
-                    state,
-                    userId: req.user.id,
-                    timestamp: new Date().toISOString()
-                })
-            }]
-        });
+        try {
+            await kafkaProducer.send({
+                topic: 'device-events',
+                messages: [{
+                    key: deviceId.toString(),
+                    value: JSON.stringify({
+                        type: 'device.state_changed',
+                        deviceId,
+                        state,
+                        userId: req.user.id,
+                        timestamp: new Date().toISOString()
+                    })
+                }]
+            });
+        } catch (kafkaError) {
+            console.error('Failed to publish to Kafka:', kafkaError);
+        }
 
         res.json({
             message: 'Device state updated',
@@ -307,22 +414,48 @@ app.delete('/api/devices/:id', authenticateToken, async (req, res) => {
         }
 
         // Publish device removed event
-        await kafkaProducer.send({
-            topic: 'device-events',
-            messages: [{
-                key: req.params.id,
-                value: JSON.stringify({
-                    type: 'device.removed',
-                    deviceId: req.params.id,
-                    userId: req.user.id,
-                    timestamp: new Date().toISOString()
-                })
-            }]
-        });
+        try {
+            await kafkaProducer.send({
+                topic: 'device-events',
+                messages: [{
+                    key: req.params.id,
+                    value: JSON.stringify({
+                        type: 'device.removed',
+                        deviceId: req.params.id,
+                        userId: req.user.id,
+                        timestamp: new Date().toISOString()
+                    })
+                }]
+            });
+        } catch (kafkaError) {
+            console.error('Failed to publish to Kafka:', kafkaError);
+        }
 
         res.json({ message: 'Device removed successfully' });
     } catch (error) {
         console.error('Remove device error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// GET /api/devices/stats - Get device statistics
+app.get('/api/devices/stats', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT 
+                COUNT(*) as total,
+                COUNT(CASE WHEN status = 'online' THEN 1 END) as online,
+                COUNT(CASE WHEN status = 'offline' THEN 1 END) as offline,
+                COUNT(DISTINCT room) as rooms,
+                COUNT(DISTINCT type) as types
+             FROM devices 
+             WHERE user_id = $1`,
+            [req.user.id]
+        );
+
+        res.json({ stats: result.rows[0] });
+    } catch (error) {
+        console.error('Get stats error:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });

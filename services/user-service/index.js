@@ -41,7 +41,7 @@ async function initDB() {
         await client.query(`
       CREATE TABLE IF NOT EXISTS homes (
         id SERIAL PRIMARY KEY,
-        user_id INTEGER REFERENCES users(id),
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
         name VARCHAR(255) NOT NULL,
         address TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -81,6 +81,17 @@ app.post('/api/register', async (req, res) => {
 
         if (!email || !password || !name) {
             return res.status(400).json({ error: 'All fields are required' });
+        }
+
+        // Validate email format
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ error: 'Invalid email format' });
+        }
+
+        // Validate password strength
+        if (password.length < 6) {
+            return res.status(400).json({ error: 'Password must be at least 6 characters' });
         }
 
         // Check if user already exists
@@ -225,11 +236,48 @@ app.get('/api/profile', authenticateToken, async (req, res) => {
     }
 });
 
+// PUT /api/profile - Update user profile
+app.put('/api/profile', authenticateToken, async (req, res) => {
+    try {
+        const { name } = req.body;
+
+        if (!name) {
+            return res.status(400).json({ error: 'Name is required' });
+        }
+
+        const result = await pool.query(
+            'UPDATE users SET name = $1 WHERE id = $2 RETURNING id, email, name',
+            [name, req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const user = result.rows[0];
+
+        // Update cache
+        await redisClient.setEx(
+            `user:${user.id}`,
+            3600,
+            JSON.stringify(user)
+        );
+
+        res.json({
+            message: 'Profile updated successfully',
+            user
+        });
+    } catch (error) {
+        console.error('Update profile error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // GET /api/homes - Get user's homes
 app.get('/api/homes', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT * FROM homes WHERE user_id = $1',
+            'SELECT * FROM homes WHERE user_id = $1 ORDER BY created_at DESC',
             [req.user.id]
         );
 
@@ -240,10 +288,33 @@ app.get('/api/homes', authenticateToken, async (req, res) => {
     }
 });
 
+// GET /api/homes/:id - Get specific home
+app.get('/api/homes/:id', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'SELECT * FROM homes WHERE id = $1 AND user_id = $2',
+            [req.params.id, req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Home not found' });
+        }
+
+        res.json({ home: result.rows[0] });
+    } catch (error) {
+        console.error('Get home error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // POST /api/homes - Create a new home
 app.post('/api/homes', authenticateToken, async (req, res) => {
     try {
         const { name, address } = req.body;
+
+        if (!name) {
+            return res.status(400).json({ error: 'Home name is required' });
+        }
 
         const result = await pool.query(
             'INSERT INTO homes (user_id, name, address) VALUES ($1, $2, $3) RETURNING *',
@@ -256,6 +327,53 @@ app.post('/api/homes', authenticateToken, async (req, res) => {
         });
     } catch (error) {
         console.error('Create home error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// PUT /api/homes/:id - Update home
+app.put('/api/homes/:id', authenticateToken, async (req, res) => {
+    try {
+        const { name, address } = req.body;
+
+        if (!name) {
+            return res.status(400).json({ error: 'Home name is required' });
+        }
+
+        const result = await pool.query(
+            'UPDATE homes SET name = $1, address = $2 WHERE id = $3 AND user_id = $4 RETURNING *',
+            [name, address || 'Not set', req.params.id, req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Home not found' });
+        }
+
+        res.json({
+            message: 'Home updated successfully',
+            home: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Update home error:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// DELETE /api/homes/:id - Delete home
+app.delete('/api/homes/:id', authenticateToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            'DELETE FROM homes WHERE id = $1 AND user_id = $2 RETURNING *',
+            [req.params.id, req.user.id]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Home not found' });
+        }
+
+        res.json({ message: 'Home deleted successfully' });
+    } catch (error) {
+        console.error('Delete home error:', error);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
