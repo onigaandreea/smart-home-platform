@@ -15,7 +15,6 @@ A compact microservices-based smart home platform for demos, local development, 
 - [Services & endpoints](#services--endpoints)
 - [Functions](#functions)
 - [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing) ✅
 - [License](#license)
 
 ---
@@ -129,14 +128,6 @@ docker compose logs <service-name>
 
 - If you see DB connection issues, ensure the DB containers are healthy and available.
 
-## Contributing ✨
-- Create a branch: `git checkout -b feat/your-feature`
-- Open a pull request against `main`
-- Keep changes small and focused, add README updates for new features
-
 ## License
 MIT — see the `LICENSE` file for details.
 
----
-
-If you'd like, I can also add badges, a short architecture diagram image, or service-specific README files under each service folder. Would you like me to add those now? 💡
